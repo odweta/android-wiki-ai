@@ -28,8 +28,8 @@ public:
     Archive(const Archive &) = delete;
     Archive &operator=(const Archive &) = delete;
 
-    // Returns up to maxResults articles ranked by a hybrid fuzzy + keyword
-    // match against `query`, each with plain-text content already extracted.
+    // Returns up to maxResults articles ranked by meaningful title keywords
+    // and title similarity, each with plain-text content already extracted.
     std::vector<SearchResult> search(const std::string &query, int maxResults);
 
     size_t articleCount() const { return titleIndex_.size(); }
@@ -59,14 +59,16 @@ private:
     bool decompressCluster(uint32_t clusterNumber, std::string *outBody, bool *outExtended);
 
     FILE *file_ = nullptr;
+    const uint8_t *mappedData_ = nullptr;
+    size_t mappedSize_ = 0;
+    void *mapping_ = nullptr;
     uint64_t fileSize_ = 0;
     Header header_{};
     std::vector<std::string> mimeTypes_;
     std::vector<uint64_t> pathPointers_;
     std::vector<uint64_t> clusterPointers_;
     std::vector<TitleIndexEntry> titleIndex_;
-    // Lowercased word -> indices into titleIndex_, for O(1) candidate lookup
-    // before the more expensive fuzzy scoring pass.
+    // Lowercased word -> indices into titleIndex_ for O(1) candidate lookup.
     std::unordered_map<std::string, std::vector<uint32_t>> wordIndex_;
 };
 

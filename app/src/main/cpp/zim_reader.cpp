@@ -4,8 +4,13 @@
 #include <zstd.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "html_strip.h"
 #include "text_similarity.h"
@@ -18,6 +23,7 @@ namespace zim {
 namespace {
 constexpr int kMaxRedirectHops = 6;
 constexpr size_t kMaxContentBytesForScoring = 20000;
+constexpr size_t kMaxDecompressedClusterBytes = 128 * 1024 * 1024;
 }
 
 std::unique_ptr<Archive> Archive::open(const std::string &path, std::string *error) {
@@ -27,9 +33,22 @@ std::unique_ptr<Archive> Archive::open(const std::string &path, std::string *err
         *error = "Could not open ZIM file.";
         return nullptr;
     }
-    fseeko(archive->file_, 0, SEEK_END);
-    archive->fileSize_ = static_cast<uint64_t>(ftello(archive->file_));
-    fseeko(archive->file_, 0, SEEK_SET);
+    struct stat fileStat {};
+    if (fstat(fileno(archive->file_), &fileStat) != 0 || fileStat.st_size <= 0 ||
+        static_cast<uint64_t>(fileStat.st_size) > std::numeric_limits<size_t>::max()) {
+        *error = "Could not determine the ZIM file size.";
+        return nullptr;
+    }
+    archive->fileSize_ = static_cast<uint64_t>(fileStat.st_size);
+    archive->mappedSize_ = static_cast<size_t>(archive->fileSize_);
+    archive->mapping_ = mmap(nullptr, archive->mappedSize_, PROT_READ, MAP_PRIVATE,
+                             fileno(archive->file_), 0);
+    if (archive->mapping_ == MAP_FAILED) {
+        archive->mapping_ = nullptr;
+        *error = "Could not map the ZIM file for fast reading.";
+        return nullptr;
+    }
+    archive->mappedData_ = static_cast<const uint8_t *>(archive->mapping_);
 
     if (!archive->loadHeader(error)) return nullptr;
     if (!archive->loadMimeTypes(error)) return nullptr;
@@ -40,13 +59,14 @@ std::unique_ptr<Archive> Archive::open(const std::string &path, std::string *err
 }
 
 Archive::~Archive() {
+    if (mapping_) munmap(mapping_, mappedSize_);
     if (file_) fclose(file_);
 }
 
 bool Archive::readAt(uint64_t offset, void *buffer, size_t size) {
-    if (offset + size > fileSize_) return false;
-    if (fseeko(file_, static_cast<off_t>(offset), SEEK_SET) != 0) return false;
-    return fread(buffer, 1, size, file_) == size;
+    if (offset > fileSize_ || size > fileSize_ - offset) return false;
+    std::memcpy(buffer, mappedData_ + offset, size);
+    return true;
 }
 
 bool Archive::loadHeader(std::string *error) {
@@ -121,17 +141,10 @@ bool Archive::loadClusterPointers(std::string *error) {
 }
 
 bool Archive::readDirentAt(uint64_t offset, DirectoryEntry *out) {
-    size_t bufSize = 512;
-    while (true) {
-        uint64_t available = fileSize_ > offset ? fileSize_ - offset : 0;
-        size_t toRead = static_cast<size_t>(std::min<uint64_t>(bufSize, available));
-        if (toRead == 0) return false;
-        std::vector<uint8_t> buf(toRead);
-        if (!readAt(offset, buf.data(), toRead)) return false;
-        if (parseDirectoryEntry(buf.data(), toRead, out)) return true;
-        if (toRead >= available || bufSize >= 65536) return false; // malformed or truly EOF
-        bufSize *= 2;
-    }
+    if (offset >= fileSize_) return false;
+    size_t available = static_cast<size_t>(
+        std::min<uint64_t>(fileSize_ - offset, 65536));
+    return parseDirectoryEntry(mappedData_ + offset, available, out);
 }
 
 bool Archive::readDirentByIndex(uint32_t entryIndex, DirectoryEntry *out) {
@@ -195,21 +208,42 @@ bool Archive::decompressCluster(uint32_t clusterNumber, std::string *outBody, bo
         return true;
     }
     if (compressionType == static_cast<int>(ClusterCompression::kZstd)) {
-        unsigned long long contentSize = ZSTD_getFrameContentSize(
-            compressed.data(), compressed.size());
-        if (contentSize == ZSTD_CONTENTSIZE_ERROR || contentSize == ZSTD_CONTENTSIZE_UNKNOWN) {
-            LOGW("Cluster %u: could not determine zstd decompressed size.", clusterNumber);
+        ZSTD_DStream *stream = ZSTD_createDStream();
+        if (!stream) return false;
+        size_t initResult = ZSTD_initDStream(stream);
+        if (ZSTD_isError(initResult)) {
+            LOGW("Cluster %u: could not initialize zstd decompression: %s", clusterNumber,
+                 ZSTD_getErrorName(initResult));
+            ZSTD_freeDStream(stream);
             return false;
         }
-        std::string decompressed(contentSize, '\0');
-        size_t result = ZSTD_decompress(&decompressed[0], decompressed.size(),
-                                         compressed.data(), compressed.size());
-        if (ZSTD_isError(result)) {
-            LOGW("Cluster %u: zstd decompression failed: %s", clusterNumber,
-                 ZSTD_getErrorName(result));
-            return false;
+
+        ZSTD_inBuffer input{compressed.data(), compressed.size(), 0};
+        std::array<char, 64 * 1024> chunk{};
+        std::string decompressed;
+        size_t remaining = 1;
+        while (input.pos < input.size || remaining != 0) {
+            ZSTD_outBuffer output{chunk.data(), chunk.size(), 0};
+            remaining = ZSTD_decompressStream(stream, &output, &input);
+            if (ZSTD_isError(remaining)) {
+                LOGW("Cluster %u: zstd decompression failed: %s", clusterNumber,
+                     ZSTD_getErrorName(remaining));
+                ZSTD_freeDStream(stream);
+                return false;
+            }
+            if (output.pos > kMaxDecompressedClusterBytes - decompressed.size()) {
+                LOGW("Cluster %u: decompressed data exceeds the safety limit.", clusterNumber);
+                ZSTD_freeDStream(stream);
+                return false;
+            }
+            decompressed.append(chunk.data(), output.pos);
+            if (input.pos == input.size && output.pos == 0 && remaining != 0) {
+                LOGW("Cluster %u: incomplete zstd frame.", clusterNumber);
+                ZSTD_freeDStream(stream);
+                return false;
+            }
         }
-        decompressed.resize(result);
+        ZSTD_freeDStream(stream);
         *outBody = std::move(decompressed);
         return true;
     }
@@ -276,46 +310,38 @@ std::vector<SearchResult> Archive::search(const std::string &query, int maxResul
 
     std::vector<SearchResult> results;
     std::string lowerQuery = toLowerAscii(query);
-    std::vector<std::string> queryWords = tokenizeWords(lowerQuery);
+    static const std::unordered_map<std::string, bool> stopWords = {
+        {"a", true}, {"an", true}, {"and", true}, {"are", true}, {"as", true},
+        {"at", true}, {"be", true}, {"by", true}, {"can", true}, {"could", true},
+        {"do", true}, {"does", true}, {"for", true}, {"from", true}, {"give", true},
+        {"how", true}, {"i", true}, {"in", true}, {"is", true}, {"it", true},
+        {"me", true}, {"of", true}, {"on", true}, {"or", true}, {"please", true},
+        {"should", true}, {"tell", true}, {"that", true}, {"the", true}, {"this", true},
+        {"to", true}, {"was", true}, {"what", true}, {"when", true}, {"where", true},
+        {"which", true}, {"who", true}, {"why", true}, {"with", true}, {"would", true},
+        {"you", true}, {"your", true}, {"definition", true}, {"define", true},
+        {"explain", true}, {"tutorial", true}, {"guide", true}, {"step", true},
+        {"steps", true}, {"stop", true}, {"prevent", true}, {"treat", true},
+    };
+    std::vector<std::string> queryWords;
+    for (const auto &word : tokenizeWords(lowerQuery)) {
+        if (word.size() > 1 && stopWords.find(word) == stopWords.end()) {
+            queryWords.push_back(word);
+        }
+    }
     if (queryWords.empty() || titleIndex_.empty()) return results;
 
-    // Pass 1: cheap candidate gathering via the exact word index, with a
-    // bounded fuzzy fallback over the vocabulary for words that don't match
-    // exactly (typo tolerance).
+    // Pass 1: cheap candidate gathering via exact meaningful-word matches.
+    // Avoid a full vocabulary/title scan for unmatched words on large archives.
     std::unordered_map<uint32_t, float> candidateScores;
     for (const auto &word : queryWords) {
         auto exact = wordIndex_.find(word);
-        if (exact != wordIndex_.end()) {
-            for (uint32_t idx : exact->second) {
-                candidateScores[idx] += 1.0f;
-            }
-            continue;
-        }
-        // Fuzzy fallback: scan the vocabulary for similarly spelled words.
-        for (const auto &entry : wordIndex_) {
-            if (std::abs(static_cast<int>(entry.first.size()) - static_cast<int>(word.size())) > 3) {
-                continue;
-            }
-            float similarity = levenshteinSimilarity(word, entry.first);
-            if (similarity < 0.72f) continue;
-            for (uint32_t idx : entry.second) {
-                candidateScores[idx] += 0.6f * similarity;
-            }
+        if (exact == wordIndex_.end()) continue;
+        for (uint32_t idx : exact->second) {
+            candidateScores[idx] += 1.0f;
         }
     }
 
-    // If the word index found nothing at all, fall back to scoring every
-    // title directly with fuzzy similarity (bounded, since titles are short).
-    if (candidateScores.empty()) {
-        for (uint32_t idx = 0; idx < titleIndex_.size(); idx++) {
-            float similarity = std::max(
-                levenshteinSimilarity(lowerQuery, titleIndex_[idx].lowerTitle),
-                jaroWinklerSimilarity(lowerQuery, titleIndex_[idx].lowerTitle));
-            if (similarity >= 0.55f) {
-                candidateScores[idx] = similarity;
-            }
-        }
-    }
     if (candidateScores.empty()) return results;
 
     // Pass 2: precise re-scoring on the (bounded) candidate set, combining
@@ -342,7 +368,7 @@ std::vector<SearchResult> Archive::search(const std::string &query, int maxResul
     // Pass 3: fetch content for the best candidates and refine the score
     // with content keyword overlap; this is the expensive step so it is
     // bounded to a small shortlist.
-    int contentShortlist = std::min<int>(static_cast<int>(scored.size()), std::max(maxResults * 4, 10));
+    int contentShortlist = std::min<int>(static_cast<int>(scored.size()), std::max(maxResults * 2, 4));
     std::vector<SearchResult> refined;
     for (int i = 0; i < contentShortlist; i++) {
         const auto &titleEntry = titleIndex_[scored[i].idx];
@@ -387,7 +413,7 @@ std::vector<SearchResult> Archive::search(const std::string &query, int maxResul
               [](const SearchResult &a, const SearchResult &b) { return a.score > b.score; });
 
     // Fail closed: drop anything that isn't at least a plausible match.
-    constexpr float kMinimumRelevance = 0.16f;
+    constexpr float kMinimumRelevance = 0.42f;
     for (auto &result : refined) {
         if (result.score < kMinimumRelevance) continue;
         results.push_back(std::move(result));

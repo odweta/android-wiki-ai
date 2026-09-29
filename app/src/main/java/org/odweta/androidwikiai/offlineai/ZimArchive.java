@@ -5,7 +5,7 @@ import java.io.Closeable;
 /**
  * JNI wrapper around the app's lightweight native ZIM reader (see
  * app/src/main/cpp/zim_reader.h). Not libzim: implements only what this app
- * needs (title/keyword/fuzzy search, plain-text article extraction).
+ * needs (title/keyword search, plain-text article extraction).
  */
 public final class ZimArchive implements Closeable {
     static {
@@ -41,7 +41,7 @@ public final class ZimArchive implements Closeable {
 
     /**
      * Returns up to {@code maxResults} articles relevant to {@code query},
-     * ranked by a hybrid fuzzy + keyword match. Empty when nothing clears
+     * ranked by a hybrid keyword + title-similarity match. Empty when nothing clears
      * the archive's minimum relevance threshold.
      */
     public Article[] search(String query, int maxResults) {
