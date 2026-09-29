@@ -4,6 +4,7 @@
 #include <llama.h>
 
 #include <algorithm>
+#include <thread>
 #include <vector>
 
 #define LOG_TAG "LlamaBridge"
@@ -39,6 +40,10 @@ std::unique_ptr<Model> Model::load(const std::string &modelPath, int contextSize
     llama_context_params ctxParams = llama_context_default_params();
     ctxParams.n_ctx = static_cast<uint32_t>(contextSize);
     ctxParams.n_batch = static_cast<uint32_t>(contextSize);
+    unsigned int cores = std::thread::hardware_concurrency();
+    int threads = static_cast<int>(std::max(2u, std::min(cores == 0 ? 2u : cores, 6u)));
+    ctxParams.n_threads = threads;
+    ctxParams.n_threads_batch = threads;
     ctxParams.no_perf = true;
 
     llama_context *ctx = llama_init_from_model(model, ctxParams);
@@ -63,14 +68,38 @@ Model::~Model() {
 std::string Model::generate(const std::string &prompt, int maxTokens, std::string *error) {
     const llama_vocab *vocab = llama_model_get_vocab(model_);
 
-    int nPrompt = -llama_tokenize(vocab, prompt.c_str(), static_cast<int32_t>(prompt.size()),
+    std::string formattedPrompt = prompt;
+    const char *chatTemplate = llama_model_chat_template(model_, nullptr);
+    if (chatTemplate) {
+        llama_chat_message message{"user", prompt.c_str()};
+        int32_t formattedSize =
+            llama_chat_apply_template(chatTemplate, &message, 1, true, nullptr, 0);
+        if (formattedSize > 0) {
+            std::vector<char> formatted(static_cast<size_t>(formattedSize) + 1);
+            int32_t written = llama_chat_apply_template(
+                chatTemplate, &message, 1, true, formatted.data(),
+                static_cast<int32_t>(formatted.size()));
+            if (written < 0 || written > formattedSize) {
+                *error = "Failed to apply the model's embedded chat template.";
+                return "";
+            }
+            formattedPrompt.assign(formatted.data(), static_cast<size_t>(written));
+        } else if (formattedSize < 0) {
+            *error = "The model's embedded chat template is not supported.";
+            return "";
+        }
+    }
+
+    int nPrompt = -llama_tokenize(vocab, formattedPrompt.c_str(),
+                                   static_cast<int32_t>(formattedPrompt.size()),
                                    nullptr, 0, true, true);
     if (nPrompt <= 0) {
         *error = "Failed to tokenize the prompt.";
         return "";
     }
     std::vector<llama_token> promptTokens(nPrompt);
-    if (llama_tokenize(vocab, prompt.c_str(), static_cast<int32_t>(prompt.size()),
+    if (llama_tokenize(vocab, formattedPrompt.c_str(),
+                        static_cast<int32_t>(formattedPrompt.size()),
                         promptTokens.data(), static_cast<int32_t>(promptTokens.size()), true,
                         true) < 0) {
         *error = "Failed to tokenize the prompt.";
@@ -90,10 +119,7 @@ std::string Model::generate(const std::string &prompt, int maxTokens, std::strin
     llama_sampler_chain_params samplerParams = llama_sampler_chain_default_params();
     samplerParams.no_perf = true;
     llama_sampler *sampler = llama_sampler_chain_init(samplerParams);
-    llama_sampler_chain_add(sampler, llama_sampler_init_top_k(40));
-    llama_sampler_chain_add(sampler, llama_sampler_init_top_p(0.9f, 1));
-    llama_sampler_chain_add(sampler, llama_sampler_init_temp(0.6f));
-    llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+    llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
 
     std::string output;
     llama_batch batch = llama_batch_get_one(promptTokens.data(),

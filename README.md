@@ -11,15 +11,16 @@ browser) and then import them.
 
 **"Ask offline assistant" runs a real, grounded, fully on-device pipeline:**
 
-1. The question is used to search the imported ZIM archive with a hybrid
-   keyword + fuzzy (typo-tolerant) match over article titles, followed by a
-   content-overlap re-score of the best candidates.
+1. The question is used to search the imported ZIM archive by meaningful
+   title keywords, followed by a content-overlap re-score of a small candidate
+   set. Common question words are ignored to avoid unrelated title matches.
 2. If no article clears a minimum relevance threshold (or the model/ZIM
    hasn't been imported yet), the app fails closed with an "I don't know"
    style refusal rather than guessing.
-3. Otherwise, the top article excerpt(s) are inserted into a prompt as
+3. Otherwise, up to two article excerpts are inserted into a prompt as
    required context, and the imported GGUF model (run on-device via
-   llama.cpp) generates an answer instructed to use only that context.
+   llama.cpp) generates a concise answer. Definitions are phrased plainly;
+   tutorials are requested as short, numbered steps.
 4. The answer is shown together with a "Grounded in: <article titles>"
    citation line.
 
@@ -42,12 +43,12 @@ network access needed to fetch native dependencies during the *build*.
     libzim: real libzim depends on Xapian for full-text search and has
     moved its build to Meson, neither of which integrates cleanly with
     Android's CMake/NDK external-native-build. This reader instead uses
-    `zstd` for cluster decompression and implements its own fuzzy +
-    keyword title search (see below). It only supports uncompressed and
+    `zstd` for cluster decompression and implements keyword title search.
+    It only supports uncompressed and
     Zstandard-compressed clusters (the compression used by modern Kiwix
     ZIM dumps); legacy LZMA2/XZ-compressed clusters are skipped.
   - `text_similarity.h` — Levenshtein + Jaro-Winkler string similarity used
-    for fuzzy/typo-tolerant article title matching.
+    for title similarity scoring.
   - `html_strip.{h,cpp}` — strips article HTML down to plain text for
     prompting.
   - `jni_bridge.cpp` — registers the native methods via `JNI_OnLoad` /
@@ -78,13 +79,20 @@ or CI machine.
 ## Known limitations
 
 - Search relevance for very large ZIM dumps (e.g. full English Wikipedia,
-  millions of articles) can be slow to index on first archive open, since
-  this lightweight reader scans the full title list in memory rather than
-  using a persisted full-text search index (as libzim/Xapian would).
-  Topic-focused ZIM dumps perform much better.
+  millions of articles) still requires an initial in-memory title-index scan.
+  Memory-mapped reads avoid a seek and temporary allocation for every entry,
+  but topic-focused ZIM dumps are still faster to open.
 - Clusters compressed with the legacy LZMA2/XZ codec are not decoded;
   articles stored in such clusters are skipped by search. Modern Kiwix ZIM
-  dumps use Zstandard, which is fully supported.
+  dumps use Zstandard, including frames that do not declare their output size.
+- Search does not generally translate between languages. A built-in
+  English-to-Czech alias maps `superconductor(s)` and `superconductivity` to
+  `supravodivost` for the sample definition question; other questions
+  generally need to use the same language as the imported ZIM dump.
+- Requests about massive bleeding return a short built-in emergency checklist
+  immediately, without waiting for ZIM search or model generation. Call the
+  local emergency number first; the checklist is not a substitute for
+  professional emergency care.
 
 ## Build
 
