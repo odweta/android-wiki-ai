@@ -82,8 +82,8 @@ public final class MainActivity extends Activity {
                     + "or run the local model, so it won't guess.");
         });
         content.addView(askButton, matchWrap());
-        answer = text("Answers will only be shown when they can be supported by local articles.",
-                16, false);
+        answer = text("Question answering is not available until this app can read ZIM articles "
+                + "and run the local model.", 16, false);
         content.addView(answer, margin(matchWrap(), 16, 0, 0, 0));
 
         ScrollView scrollView = new ScrollView(this);
