@@ -30,15 +30,20 @@ public final class MainActivity extends Activity {
     private static final String WIKIPEDIA_FILE = "wikipedia.zim";
 
     private final ExecutorService importExecutor = Executors.newSingleThreadExecutor();
+    private AssistantController assistant;
     private TextView modelStatus;
     private TextView wikipediaStatus;
     private TextView answer;
     private Button modelButton;
     private Button wikipediaButton;
+    private Button askButton;
+    private EditText questionInput;
 
     @Override
     public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        assistant = new AssistantController(
+                new File(getFilesDir(), MODEL_FILE), new File(getFilesDir(), WIKIPEDIA_FILE));
         render();
         refreshResourceStatus();
     }
@@ -75,20 +80,35 @@ public final class MainActivity extends Activity {
         question.setMinLines(2);
         question.setGravity(Gravity.TOP | Gravity.START);
         content.addView(question, margin(matchWrap(), 6, 0, 0, 8));
+        questionInput = question;
 
-        Button askButton = button("Ask offline assistant");
-        askButton.setOnClickListener(view -> {
-            answer.setText("I don't know. This version cannot yet read ZIM articles "
-                    + "or run the local model, so it won't guess.");
-        });
+        askButton = button("Ask offline assistant");
+        askButton.setOnClickListener(view -> askAssistant());
         content.addView(askButton, matchWrap());
-        answer = text("Question answering is not available until this app can read ZIM articles "
-                + "and run the local model.", 16, false);
+        answer = text("Question answering is not available until a model and a Wikipedia dump "
+                + "are imported.", 16, false);
         content.addView(answer, margin(matchWrap(), 16, 0, 0, 0));
 
         ScrollView scrollView = new ScrollView(this);
         scrollView.addView(content);
         setContentView(scrollView);
+    }
+
+    private void askAssistant() {
+        String questionText = questionInput.getText().toString();
+        askButton.setEnabled(false);
+        answer.setText("Thinking…");
+        importExecutor.execute(() -> {
+            AssistantController.Answer result = assistant.ask(questionText);
+            runOnUiThread(() -> {
+                askButton.setEnabled(true);
+                String text = result.text;
+                if (!result.citations.isEmpty()) {
+                    text += "\n\nGrounded in: " + String.join(", ", result.citations);
+                }
+                answer.setText(text);
+            });
+        });
     }
 
     private void chooseFile(int requestCode) {
@@ -237,6 +257,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         importExecutor.shutdown();
+        assistant.close();
         super.onDestroy();
     }
 }
